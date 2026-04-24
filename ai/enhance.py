@@ -13,13 +13,7 @@ import dotenv
 import argparse
 from tqdm import tqdm
 
-import langchain_core.exceptions
-from langchain_openai import ChatOpenAI
-from langchain.prompts import (
-    ChatPromptTemplate,
-    SystemMessagePromptTemplate,
-    HumanMessagePromptTemplate,
-)
+from openai import OpenAI
 from structure import Structure
 
 if os.path.exists('.env'):
@@ -34,7 +28,7 @@ def parse_args():
     parser.add_argument("--max_workers", type=int, default=1, help="Maximum number of parallel workers")
     return parser.parse_args()
 
-def process_single_item(chain, item: Dict, language: str) -> Dict:
+def process_single_item(client: OpenAI, model_name: str, item: Dict, language: str) -> Dict:
     def is_sensitive(content: str) -> bool:
         """
         调用 spam.dw-dengwei.workers.dev 接口检测内容是否包含敏感词。
@@ -125,30 +119,16 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
     }
     
     try:
-        response: Structure = chain.invoke({
-            "language": language,
-            "content": item['summary']
-        })
+        completion = client.beta.chat.completions.parse(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": system.format(language=language)},
+                {"role": "user", "content": template.format(content=item['summary'])},
+            ],
+            response_format=Structure,
+        )
+        response: Structure = completion.choices[0].message.parsed
         item['AI'] = response.model_dump()
-    except langchain_core.exceptions.OutputParserException as e:
-        # 尝试从错误信息中提取 JSON 字符串并修复
-        error_msg = str(e)
-        partial_data = {}
-        
-        if "Function Structure arguments:" in error_msg:
-            try:
-                # 提取 JSON 字符串
-                json_str = error_msg.split("Function Structure arguments:", 1)[1].strip().split('are not valid JSON')[0].strip()
-                # 预处理 LaTeX 数学符号 - 使用四个反斜杠来确保正确转义
-                json_str = json_str.replace('\\', '\\\\')
-                # 尝试解析修复后的 JSON
-                partial_data = json.loads(json_str)
-            except Exception as json_e:
-                print(f"Failed to parse JSON for {item.get('id', 'unknown')}: {json_e}", file=sys.stderr)
-        
-        # Merge partial data with defaults to ensure all fields exist
-        item['AI'] = {**default_ai_fields, **partial_data}
-        print(f"Using partial AI data for {item.get('id', 'unknown')}: {list(partial_data.keys())}", file=sys.stderr)
     except Exception as e:
         # Catch any other exceptions and provide default values
         print(f"Unexpected error for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
@@ -167,22 +147,16 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
 
 def process_all_items(data: List[Dict], model_name: str, language: str, max_workers: int) -> List[Dict]:
     """并行处理所有数据项"""
-    llm = ChatOpenAI(model=model_name).with_structured_output(Structure, method="function_calling")
+    base_url = os.environ.get("OPENAI_BASE_URL")
+    client = OpenAI(base_url=base_url) if base_url else OpenAI()
     print('Connect to:', model_name, file=sys.stderr)
-    
-    prompt_template = ChatPromptTemplate.from_messages([
-        SystemMessagePromptTemplate.from_template(system),
-        HumanMessagePromptTemplate.from_template(template=template)
-    ])
-
-    chain = prompt_template | llm
     
     # 使用线程池并行处理
     processed_data = [None] * len(data)  # 预分配结果列表
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # 提交所有任务
         future_to_idx = {
-            executor.submit(process_single_item, chain, item, language): idx
+            executor.submit(process_single_item, client, model_name, item, language): idx
             for idx, item in enumerate(data)
         }
         
