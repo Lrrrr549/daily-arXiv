@@ -21,6 +21,23 @@ if os.path.exists('.env'):
 template = open("template.txt", "r").read()
 system = open("system.txt", "r").read()
 
+
+def extract_json_object(text: str) -> str:
+    """从模型输出中提取 JSON 对象字符串。"""
+    if not text:
+        return ""
+
+    code_block_match = re.search(r"```(?:json)?\s*({.*?})\s*```", text, re.DOTALL)
+    if code_block_match:
+        return code_block_match.group(1)
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start:end + 1]
+
+    return text.strip()
+
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser()
@@ -130,9 +147,35 @@ def process_single_item(client: OpenAI, model_name: str, item: Dict, language: s
         response: Structure = completion.choices[0].message.parsed
         item['AI'] = response.model_dump()
     except Exception as e:
-        # Catch any other exceptions and provide default values
-        print(f"Unexpected error for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
-        item['AI'] = default_ai_fields
+        error_msg = str(e)
+        try:
+            # 兼容不支持 `response_format=Structure` 的 OpenAI 兼容服务
+            completion = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system.format(language=language)},
+                    {
+                        "role": "user",
+                        "content": (
+                            template.format(content=item['summary'])
+                            + "\n\n请仅输出 JSON 对象，且必须包含字段："
+                              "tldr, motivation, method, result, conclusion。"
+                        ),
+                    },
+                ],
+            )
+            raw_content = completion.choices[0].message.content or ""
+            json_text = extract_json_object(raw_content)
+            response = Structure.model_validate(json.loads(json_text))
+            item['AI'] = response.model_dump()
+        except Exception as fallback_error:
+            # Catch any other exceptions and provide default values
+            print(
+                f"Unexpected error for {item.get('id', 'unknown')}: {error_msg}; "
+                f"fallback failed: {fallback_error}",
+                file=sys.stderr,
+            )
+            item['AI'] = default_ai_fields
     
     # Final validation to ensure all required fields exist
     for field in default_ai_fields.keys():
