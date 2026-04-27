@@ -2,6 +2,7 @@ import os
 import json
 import sys
 import re
+from json import JSONDecodeError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict
 from queue import Queue
@@ -23,7 +24,7 @@ system = open("system.txt", "r").read()
 
 
 def extract_json_object(text: str) -> str:
-    """从模型输出中提取 JSON 对象字符串。"""
+    """Extract JSON object string from model output."""
     if not text:
         return ""
 
@@ -148,31 +149,53 @@ def process_single_item(client: OpenAI, model_name: str, item: Dict, language: s
         item['AI'] = response.model_dump()
     except Exception as e:
         error_msg = str(e)
-        try:
-            # 兼容不支持 `response_format=Structure` 的 OpenAI 兼容服务
-            completion = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": system.format(language=language)},
-                    {
-                        "role": "user",
-                        "content": (
-                            template.format(content=item['summary'])
-                            + "\n\n请仅输出 JSON 对象，且必须包含字段："
-                              "tldr, motivation, method, result, conclusion。"
-                        ),
-                    },
-                ],
+        should_try_fallback = (
+            "response_format" in error_msg
+            and ("unavailable" in error_msg or "unsupported" in error_msg or "invalid_request_error" in error_msg)
+        )
+        if should_try_fallback:
+            fallback_instruction = (
+                "Please output only a JSON object with keys: "
+                "tldr, motivation, method, result, conclusion."
+                if str(language).lower().startswith("en")
+                else "请仅输出 JSON 对象，且必须包含字段："
+                     "tldr, motivation, method, result, conclusion。"
             )
-            raw_content = completion.choices[0].message.content or ""
-            json_text = extract_json_object(raw_content)
-            response = Structure.model_validate(json.loads(json_text))
-            item['AI'] = response.model_dump()
-        except Exception as fallback_error:
-            # Catch any other exceptions and provide default values
+
+            try:
+                # Compatibility for OpenAI-compatible services that don't support `response_format=Structure`
+                completion = client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": system.format(language=language)},
+                        {
+                            "role": "user",
+                            "content": (
+                                template.format(content=item['summary'])
+                                + f"\n\n{fallback_instruction}"
+                            ),
+                        },
+                    ],
+                )
+                raw_content = completion.choices[0].message.content or ""
+                json_text = extract_json_object(raw_content)
+                try:
+                    parsed_json = json.loads(json_text)
+                except JSONDecodeError as json_error:
+                    raise ValueError(f"Fallback JSON decode failed. Raw content: {raw_content[:300]}") from json_error
+                response = Structure.model_validate(parsed_json)
+                item['AI'] = response.model_dump()
+            except Exception as fallback_error:
+                # Catch any other exceptions and provide default values
+                print(
+                    f"Unexpected error for {item.get('id', 'unknown')}: {error_msg}; "
+                    f"fallback failed: {fallback_error}",
+                    file=sys.stderr,
+                )
+                item['AI'] = default_ai_fields
+        else:
             print(
-                f"Unexpected error for {item.get('id', 'unknown')}: {error_msg}; "
-                f"fallback failed: {fallback_error}",
+                f"Unexpected error for {item.get('id', 'unknown')}: {error_msg}",
                 file=sys.stderr,
             )
             item['AI'] = default_ai_fields
