@@ -2,6 +2,7 @@ import os
 import json
 import sys
 import re
+from json import JSONDecodeError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict
 from queue import Queue
@@ -20,6 +21,34 @@ if os.path.exists('.env'):
     dotenv.load_dotenv()
 template = open("template.txt", "r").read()
 system = open("system.txt", "r").read()
+
+
+def extract_json_object(text: str) -> str:
+    """
+    Extract a JSON object string from model output.
+
+    Priority:
+    1) If a fenced code block exists, parse the content inside the first block.
+    2) Otherwise, parse from the first '{' to the last '}' in the whole text.
+    3) If no braces are found, return stripped original text.
+    """
+    if not text:
+        return ""
+
+    code_block_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    if code_block_match:
+        code_text = code_block_match.group(1)
+        start = code_text.find("{")
+        end = code_text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return code_text[start:end + 1]
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start:end + 1]
+
+    return text.strip()
 
 def parse_args():
     """解析命令行参数"""
@@ -130,9 +159,63 @@ def process_single_item(client: OpenAI, model_name: str, item: Dict, language: s
         response: Structure = completion.choices[0].message.parsed
         item['AI'] = response.model_dump()
     except Exception as e:
-        # Catch any other exceptions and provide default values
-        print(f"Unexpected error for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
-        item['AI'] = default_ai_fields
+        error_msg = str(e)
+        error_code = getattr(e, "code", None) or getattr(getattr(e, "error", None), "code", None)
+        message_lower = error_msg.lower()
+        should_try_fallback = (
+            error_code == "invalid_request_error"
+            or (
+                "response_format" in message_lower
+                and ("unavailable" in message_lower or "unsupported" in message_lower or "invalid_request_error" in message_lower)
+            )
+        )
+        if should_try_fallback:
+            language_str = language if isinstance(language, str) else ""
+            fallback_instruction = (
+                "Please output only a JSON object with keys: "
+                "tldr, motivation, method, result, conclusion."
+                if language_str.lower().startswith("en")
+                else "请仅输出 JSON 对象，且必须包含字段："
+                     "tldr, motivation, method, result, conclusion。"
+            )
+
+            try:
+                # Compatibility for OpenAI-compatible services that don't support `response_format=Structure`
+                completion = client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": system.format(language=language)},
+                        {
+                            "role": "user",
+                            "content": (
+                                template.format(content=item['summary'])
+                                + f"\n\n{fallback_instruction}"
+                            ),
+                        },
+                    ],
+                )
+                raw_content = completion.choices[0].message.content or ""
+                json_text = extract_json_object(raw_content)
+                try:
+                    parsed_json = json.loads(json_text)
+                except JSONDecodeError as json_error:
+                    raise ValueError(f"Fallback JSON decode failed. Raw content: {raw_content[:1000]}") from json_error
+                response = Structure.model_validate(parsed_json)
+                item['AI'] = response.model_dump()
+            except Exception as fallback_error:
+                # Catch any other exceptions and provide default values
+                print(
+                    f"Unexpected error for {item.get('id', 'unknown')}: {error_msg}; "
+                    f"fallback failed: {fallback_error}",
+                    file=sys.stderr,
+                )
+                item['AI'] = default_ai_fields
+        else:
+            print(
+                f"Unexpected error for {item.get('id', 'unknown')}: {error_msg}",
+                file=sys.stderr,
+            )
+            item['AI'] = default_ai_fields
     
     # Final validation to ensure all required fields exist
     for field in default_ai_fields.keys():
